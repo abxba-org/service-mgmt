@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+# tailscale-services - declarative localhost service exposure via Tailscale Serve/Funnel.
+set -euo pipefail
+
+PROG="${0##*/}"
+DEFAULT_CONFIG="/etc/tailscale-services/services.conf"
+TAILSCALE_BIN="${TAILSCALE_BIN:-tailscale}"
+TS_SKIP_PORT_CHECK="${TS_SKIP_PORT_CHECK:-0}"
+
+CONFIG_FILE="$DEFAULT_CONFIG"
+ALLOW_FUNNEL=0
+ASSUME_YES=0
+DRY_RUN=0
+COMMAND=""
+
+TS_SERVE_HELP=""
+TS_FUNNEL_HELP=""
+
+declare -A SEEN_NAME=()
+declare -A SEEN_ROUTE=()
+declare -A FUNNEL_PORTS=()
+declare -a SERVICES=()
+
+usage() {
+  cat <<EOF
+Usage: $PROG <apply|status|reset|validate> [options]
+
+Commands:
+  apply        Validate config and apply Tailscale Serve/Funnel config
+  status       Show Tailscale status and parsed services
+  reset        Remove configured Tailscale Serve/Funnel handlers from config listeners
+  validate     Validate config and print resolved plan without applying
+
+Options:
+  -c, --config FILE     Config file (default: $DEFAULT_CONFIG)
+      --allow-funnel    Required to allow public internet exposure with Funnel
+      --yes             Confirm public exposure when Funnel entries exist
+      --dry-run         Print commands instead of executing them
+  -h, --help            Show this help
+
+Config format (whitespace-separated, one service per line):
+  <name> <localhost_target> <path_or_hostname> [exposure] [tls] [auth]
+
+Examples:
+  web   127.0.0.1:8080 /                 tailnet https tailnet
+  api   localhost:9090 /api              tailnet https tailnet
+  pub   127.0.0.1:7000 /public           funnel  https none
+
+Notes:
+  - localhost_target must point to localhost (127.0.0.1, localhost, or [::1]).
+  - exposure is tailnet (default) or funnel (public internet).
+  - tls is https (default, listener 443) or http (listener 80).
+  - auth is metadata for operator intent and currently informational only.
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "WARN: $*" >&2
+}
+
+info() {
+  echo "INFO: $*"
+}
+
+trim_line() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+ts() {
+  "$TAILSCALE_BIN" "$@"
+}
+
+quote_cmd() {
+  local out="" arg
+  for arg in "$@"; do
+    out+="${out:+ }$(printf '%q' "$arg")"
+  done
+  printf '%s\n' "$out"
+}
+
+run_cmd() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "+ $(quote_cmd "$@")"
+    return 0
+  fi
+  "$@"
+}
+
+serve_help() {
+  if [[ -z "$TS_SERVE_HELP" ]]; then
+    TS_SERVE_HELP="$(ts serve --help 2>&1 || true)"
+  fi
+  printf '%s\n' "$TS_SERVE_HELP"
+}
+
+funnel_help() {
+  if [[ -z "$TS_FUNNEL_HELP" ]]; then
+    TS_FUNNEL_HELP="$(ts funnel --help 2>&1 || true)"
+  fi
+  printf '%s\n' "$TS_FUNNEL_HELP"
+}
+
+serve_supports_hostname() {
+  serve_help | grep -q -- '--hostname'
+}
+
+serve_supports_reset() {
+  serve_help | grep -qi 'reset'
+}
+
+funnel_supports_reset() {
+  funnel_help | grep -qi 'reset'
+}
+
+validate_service_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || return 1
+}
+
+normalize_target() {
+  local target="$1"
+  local host port
+
+  if [[ "$target" =~ ^[0-9]+$ ]]; then
+    printf '127.0.0.1:%s\n' "$target"
+    return 0
+  fi
+
+  if [[ "$target" =~ ^\[::1\]:([0-9]{1,5})$ ]]; then
+    port="${BASH_REMATCH[1]}"
+    (( port >= 1 && port <= 65535 )) || return 1
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  if [[ "$target" =~ ^([^:]+):([0-9]{1,5})$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+    (( port >= 1 && port <= 65535 )) || return 1
+    case "$host" in
+      127.0.0.1|localhost)
+        printf '127.0.0.1:%s\n' "$port"
+        return 0
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  fi
+
+  return 1
+}
+
+target_port() {
+  local target="$1"
+  if [[ "$target" =~ :([0-9]{1,5})$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+validate_path_route() {
+  local route="$1"
+  [[ "$route" == /* ]] || return 1
+  [[ "$route" =~ ^/[a-zA-Z0-9._~/-]*$ ]] || return 1
+  [[ "$route" != *"//"* ]] || return 1
+  return 0
+}
+
+validate_hostname_route() {
+  local route="${1,,}"
+  [[ "$route" != *"*"* ]] || return 1
+  [[ "$route" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+}
+
+port_is_listening() {
+  local port="$1"
+  if ! command -v ss >/dev/null 2>&1; then
+    warn "ss not available; skipping local port-listening checks"
+    return 0
+  fi
+
+  ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:.])${port}$"
+}
+
+preflight() {
+  require_cmd "$TAILSCALE_BIN"
+  if ! ts status --json 2>/dev/null | grep -q '"BackendState":"Running"'; then
+    die "Tailscale is not running/authenticated. Run: tailscale up"
+  fi
+}
+
+parse_config() {
+  local line raw line_no=0
+  local name target route exposure tls auth normalized_target
+  local route_type route_key route_lc listener
+  local existing_service existing_name existing_target existing_route existing_route_type existing_exposure existing_tls existing_auth existing_listener
+
+  [[ -r "$CONFIG_FILE" ]] || die "Config file not readable: $CONFIG_FILE"
+
+  SERVICES=()
+  SEEN_NAME=()
+  SEEN_ROUTE=()
+  FUNNEL_PORTS=()
+
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line_no=$((line_no + 1))
+    line="${raw%%#*}"
+    line="$(trim_line "$line")"
+    [[ -z "$line" ]] && continue
+
+    set -- $line
+    [[ $# -ge 3 && $# -le 6 ]] || die "Line $line_no: expected 3-6 fields, got $#"
+
+    name="$1"
+    target="$2"
+    route="$3"
+    exposure="${4:-tailnet}"
+    tls="${5:-https}"
+    auth="${6:-tailnet}"
+
+    validate_service_name "$name" || die "Line $line_no: invalid service name '$name'"
+    [[ -z "${SEEN_NAME[$name]:-}" ]] || die "Line $line_no: duplicate service name '$name'"
+    SEEN_NAME["$name"]=1
+
+    normalized_target="$(normalize_target "$target")" || die "Line $line_no: target must be localhost-only, got '$target'"
+    target="$normalized_target"
+
+    case "$exposure" in
+      tailnet|funnel) ;;
+      *) die "Line $line_no: exposure must be tailnet or funnel (got '$exposure')" ;;
+    esac
+
+    case "$tls" in
+      https) listener=443 ;;
+      http) listener=80 ;;
+      *) die "Line $line_no: tls must be https or http (got '$tls')" ;;
+    esac
+
+    case "$auth" in
+      tailnet|none) ;;
+      *) die "Line $line_no: auth must be tailnet or none (got '$auth')" ;;
+    esac
+
+    if [[ "$route" == /* ]]; then
+      route_type="path"
+      validate_path_route "$route" || die "Line $line_no: invalid path route '$route'"
+
+      for existing_service in "${SERVICES[@]}"; do
+        IFS=$'\t' read -r existing_name existing_target existing_route existing_route_type existing_exposure existing_tls existing_auth existing_listener <<<"$existing_service"
+        if [[ "$existing_route_type" == "path" && "$existing_tls" == "$tls" && "$existing_listener" == "$listener" ]]; then
+          if [[ "$route" == "$existing_route" || "$route" == "$existing_route/"* || "$existing_route" == "$route/"* ]]; then
+            die "Line $line_no: route '$route' overlaps existing route '$existing_route' on ${tls}/${listener}"
+          fi
+        fi
+      done
+      route_key="${tls}:${listener}:${route}"
+    else
+      route_type="hostname"
+      validate_hostname_route "$route" || die "Line $line_no: invalid hostname route '$route'"
+      route_lc="${route,,}"
+      if ! serve_supports_hostname; then
+        die "Line $line_no: hostname route '$route' requires a tailscale version with --hostname support. Use path routes (for example /$name) on this host."
+      fi
+      route_key="${tls}:${listener}:host:${route_lc}"
+    fi
+
+    [[ -z "${SEEN_ROUTE[$route_key]:-}" ]] || die "Line $line_no: duplicate route '$route'"
+    SEEN_ROUTE["$route_key"]=1
+
+    if [[ "$TS_SKIP_PORT_CHECK" -ne 1 ]]; then
+      if ! port_is_listening "$(target_port "$target")"; then
+        die "Line $line_no: target port not listening: $target"
+      fi
+    fi
+
+    if [[ "$exposure" == "funnel" ]]; then
+      FUNNEL_PORTS["$listener"]=1
+    fi
+
+    SERVICES+=("$name"$'\t'"$target"$'\t'"$route"$'\t'"$route_type"$'\t'"$exposure"$'\t'"$tls"$'\t'"$auth"$'\t'"$listener")
+  done < "$CONFIG_FILE"
+
+  [[ "${#SERVICES[@]}" -gt 0 ]] || die "No services found in $CONFIG_FILE"
+}
+
+require_funnel_confirmation() {
+  [[ "${#FUNNEL_PORTS[@]}" -eq 0 ]] && return 0
+
+  [[ "$ALLOW_FUNNEL" -eq 1 ]] || die "Config includes funnel exposure. Re-run with --allow-funnel."
+  [[ "$ASSUME_YES" -eq 1 ]] && return 0
+
+  if [[ ! -t 0 ]]; then
+    die "Funnel exposure requires explicit confirmation. Re-run with --yes."
+  fi
+
+  echo "Funnel makes services publicly reachable from the internet."
+  read -r -p "Type 'yes' to continue: " ans
+  [[ "$ans" == "yes" ]] || die "Aborted by user."
+}
+
+sorted_services() {
+  printf '%s\n' "${SERVICES[@]}" | sort
+}
+
+apply_services() {
+  local service name target route route_type exposure tls auth listener
+  local -A funnel_enabled=()
+
+  if serve_supports_reset; then
+    run_cmd "$TAILSCALE_BIN" serve reset
+  else
+    warn "tailscale serve reset not supported; attempting per-listener off"
+    run_cmd "$TAILSCALE_BIN" serve --https=443 off || true
+    run_cmd "$TAILSCALE_BIN" serve --http=80 off || true
+  fi
+
+  if funnel_supports_reset; then
+    run_cmd "$TAILSCALE_BIN" funnel reset || true
+  fi
+
+  while IFS= read -r service || [[ -n "$service" ]]; do
+    [[ -z "$service" ]] && continue
+    IFS=$'\t' read -r name target route route_type exposure tls auth listener <<<"$service"
+
+    if [[ "$route_type" == "path" ]]; then
+      run_cmd "$TAILSCALE_BIN" serve --bg "--${tls}=${listener}" "$route" "http://$target"
+    else
+      run_cmd "$TAILSCALE_BIN" serve --bg "--${tls}=${listener}" "--hostname=${route}" "/" "http://$target"
+    fi
+
+    if [[ "$exposure" == "funnel" && -z "${funnel_enabled[$listener]:-}" ]]; then
+      run_cmd "$TAILSCALE_BIN" funnel "$listener" on
+      funnel_enabled["$listener"]=1
+    fi
+  done < <(sorted_services)
+}
+
+show_plan() {
+  local service name target route route_type exposure tls auth listener
+  echo "Resolved services:"
+  while IFS= read -r service || [[ -n "$service" ]]; do
+    [[ -z "$service" ]] && continue
+    IFS=$'\t' read -r name target route route_type exposure tls auth listener <<<"$service"
+    printf '  - %s: %s -> %s (%s, %s/%s, auth=%s)\n' \
+      "$name" "$route" "$target" "$route_type" "$tls" "$exposure" "$auth"
+  done < <(sorted_services)
+}
+
+status_cmd() {
+  parse_config
+  show_plan
+  echo
+  run_cmd "$TAILSCALE_BIN" serve status
+  echo
+  run_cmd "$TAILSCALE_BIN" funnel status
+}
+
+reset_cmd() {
+  parse_config
+  require_funnel_confirmation
+
+  if serve_supports_reset; then
+    run_cmd "$TAILSCALE_BIN" serve reset
+  else
+    run_cmd "$TAILSCALE_BIN" serve --https=443 off || true
+    run_cmd "$TAILSCALE_BIN" serve --http=80 off || true
+  fi
+
+  local listener
+  for listener in "${!FUNNEL_PORTS[@]}"; do
+    run_cmd "$TAILSCALE_BIN" funnel "$listener" off || true
+  done
+}
+
+parse_args() {
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+  COMMAND="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--config)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        CONFIG_FILE="$2"
+        shift 2
+        ;;
+      --allow-funnel)
+        ALLOW_FUNNEL=1
+        shift
+        ;;
+      --yes)
+        ASSUME_YES=1
+        shift
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+  preflight
+
+  case "$COMMAND" in
+    apply)
+      parse_config
+      require_funnel_confirmation
+      show_plan
+      apply_services
+      info "Apply complete."
+      ;;
+    validate)
+      parse_config
+      require_funnel_confirmation
+      show_plan
+      info "Validation complete."
+      ;;
+    status)
+      status_cmd
+      ;;
+    reset)
+      reset_cmd
+      info "Reset complete."
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
