@@ -198,7 +198,7 @@ port_is_listening() {
 
 preflight() {
   require_cmd "$TAILSCALE_BIN"
-  if ! ts status --json 2>/dev/null | grep -q '"BackendState":"Running"'; then
+  if ! ts status --json 2>/dev/null | grep -q '"BackendState": "Running"'; then
     die "Tailscale is not running/authenticated. Run: tailscale up"
   fi
 }
@@ -318,7 +318,6 @@ sorted_services() {
 
 apply_services() {
   local service name target route route_type exposure tls auth listener
-  local -A funnel_enabled=()
 
   if serve_supports_reset; then
     run_cmd "$TAILSCALE_BIN" serve reset
@@ -337,14 +336,17 @@ apply_services() {
     IFS=$'\t' read -r name target route route_type exposure tls auth listener <<<"$service"
 
     if [[ "$route_type" == "path" ]]; then
-      run_cmd "$TAILSCALE_BIN" serve --bg "--${tls}=${listener}" "$route" "http://$target"
+      run_cmd "$TAILSCALE_BIN" serve --bg "--${tls}=${listener}" "--set-path=${route}" "http://$target"
     else
-      run_cmd "$TAILSCALE_BIN" serve --bg "--${tls}=${listener}" "--hostname=${route}" "/" "http://$target"
+      run_cmd "$TAILSCALE_BIN" serve --bg "--${tls}=${listener}" "--hostname=${route}" "--set-path=/" "http://$target"
     fi
 
-    if [[ "$exposure" == "funnel" && -z "${funnel_enabled[$listener]:-}" ]]; then
-      run_cmd "$TAILSCALE_BIN" funnel "$listener" on
-      funnel_enabled["$listener"]=1
+    if [[ "$exposure" == "funnel" ]]; then
+      if [[ "$route_type" == "path" ]]; then
+        run_cmd "$TAILSCALE_BIN" funnel --bg "--${tls}=${listener}" "--set-path=${route}" "http://$target"
+      else
+        run_cmd "$TAILSCALE_BIN" funnel --bg "--${tls}=${listener}" "--hostname=${route}" "--set-path=/" "http://$target"
+      fi
     fi
   done < <(sorted_services)
 }
@@ -382,7 +384,7 @@ reset_cmd() {
 
   local listener
   for listener in "${!FUNNEL_PORTS[@]}"; do
-    run_cmd "$TAILSCALE_BIN" funnel "$listener" off || true
+    run_cmd "$TAILSCALE_BIN" funnel "--${listener}" off || true
   done
 }
 
